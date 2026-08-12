@@ -6,82 +6,6 @@ on:
   workflow_dispatch:
 
 jobs:
-  snli:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: Download and normalize SNLI
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p raw out/snli
-          curl -fL --retry 4 --retry-all-errors -o raw/snli.zip https://nlp.stanford.edu/projects/snli/snli_1.0.zip
-          sha256sum raw/snli.zip > out/snli/SOURCE_SHA256.txt
-          unzip -q raw/snli.zip -d raw/snli
-          python - <<'PY'
-          import json, pathlib
-          raw=pathlib.Path('raw/snli'); out=pathlib.Path('out/snli')
-          counts={}
-          for split in ('train','dev','test'):
-              matches=list(raw.rglob(f'snli_1.0_{split}.jsonl'))
-              if not matches: raise SystemExit(f'missing SNLI {split}')
-              n=0
-              with matches[0].open(encoding='utf-8') as fi,(out/f'{split}.jsonl').open('w',encoding='utf-8') as fo:
-                  for line in fi:
-                      r=json.loads(line); y=r.get('gold_label')
-                      if y not in {'entailment','neutral','contradiction'}: continue
-                      fo.write(json.dumps({'premise':r['sentence1'],'hypothesis':r['sentence2'],'label':y},ensure_ascii=False)+'\n'); n+=1
-              counts[split]=n
-          if counts['train'] < 500000 or counts['dev'] < 9000 or counts['test'] < 9000:
-              raise SystemExit(f'unexpected SNLI counts {counts}')
-          (out/'manifest.json').write_text(json.dumps({'dataset':'SNLI','source':'https://nlp.stanford.edu/projects/snli/snli_1.0.zip','counts':counts},indent=2))
-          print(counts)
-          PY
-          find out/snli -type f -print0 | sort -z | xargs -0 sha256sum > out/snli/SHA256SUMS.txt
-      - uses: actions/upload-artifact@v4
-        with:
-          name: sense-semantic-snli
-          path: out/snli/
-          retention-days: 1
-          compression-level: 9
-          if-no-files-found: error
-
-  paws:
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    steps:
-      - name: Download and normalize PAWS labeled-final
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p out/paws
-          python -m pip install -q 'datasets>=3,<5'
-          python - <<'PY'
-          import json, pathlib
-          from datasets import load_dataset
-          out=pathlib.Path('out/paws')
-          ds=load_dataset('google-research-datasets/paws','labeled_final')
-          mapping={'train':'train','validation':'dev','test':'test'}; counts={}
-          for hf_split,dst_name in mapping.items():
-              rows=ds[hf_split]; dst=out/f'{dst_name}.jsonl'; n=0
-              with dst.open('w',encoding='utf-8') as fo:
-                  for r in rows:
-                      fo.write(json.dumps({'sentence1':r['sentence1'],'sentence2':r['sentence2'],'label':int(r['label'])},ensure_ascii=False)+'\n'); n+=1
-              counts[dst_name]=n
-          expected={'train':49401,'dev':8000,'test':8000}
-          if counts != expected: raise SystemExit(f'unexpected PAWS counts {counts}, expected {expected}')
-          (out/'manifest.json').write_text(json.dumps({'dataset':'PAWS-Wiki labeled-final','source':'https://huggingface.co/datasets/google-research-datasets/paws','config':'labeled_final','counts':counts},indent=2))
-          print(counts)
-          PY
-          find out/paws -type f -print0 | sort -z | xargs -0 sha256sum > out/paws/SHA256SUMS.txt
-      - uses: actions/upload-artifact@v4
-        with:
-          name: sense-semantic-paws
-          path: out/paws/
-          retention-days: 1
-          compression-level: 9
-          if-no-files-found: error
-
   presto:
     runs-on: ubuntu-latest
     timeout-minutes: 20
@@ -108,8 +32,8 @@ jobs:
                       if not locale.lower().startswith('en'): continue
                       fo.write(json.dumps(r,ensure_ascii=False)+'\n'); n+=1
               counts[split]=n
-          if counts['train'] < 50000 or counts['dev'] < 1000 or counts['test'] < 1000:
-              raise SystemExit(f'unexpectedly small English PRESTO splits {counts}')
+          expected={'train':47806,'dev':14288,'test':33577}
+          if counts != expected: raise SystemExit(f'unexpected PRESTO English counts {counts}, expected {expected}')
           (out/'manifest.json').write_text(json.dumps({'dataset':'PRESTO English','source':'https://storage.googleapis.com/gresearch/presto/presto_v1.zip','counts':counts},indent=2))
           print(counts)
           PY
