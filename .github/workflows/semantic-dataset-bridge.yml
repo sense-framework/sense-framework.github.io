@@ -6,17 +6,151 @@ on:
   workflow_dispatch:
 
 jobs:
-  bridge:
+  acquire:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - name: Create transport proof
+      - name: Download official datasets
+        shell: bash
         run: |
-          mkdir -p out
-          printf 'SENSE semantic dataset bridge OK\n' > out/bridge-test.txt
-          sha256sum out/bridge-test.txt > out/SHA256SUMS.txt
+          set -euo pipefail
+          mkdir -p raw out/snli out/paws out/presto
+          curl -fL --retry 4 --retry-all-errors -o raw/snli.zip https://nlp.stanford.edu/projects/snli/snli_1.0.zip
+          curl -fL --retry 4 --retry-all-errors -o raw/paws.tar.gz https://storage.googleapis.com/paws/english/paws_wiki_labeled_final.tar.gz
+          curl -fL --retry 4 --retry-all-errors -o raw/presto.zip https://storage.googleapis.com/gresearch/presto/presto_v1.zip
+          sha256sum raw/* | tee raw/SOURCE_SHA256SUMS.txt
+          unzip -q raw/snli.zip -d raw/snli
+          tar -xzf raw/paws.tar.gz -C raw
+          unzip -q raw/presto.zip -d raw/presto
+
+      - name: Normalize supervised splits
+        shell: python
+        run: |
+          import csv, json, pathlib, sys
+          root = pathlib.Path('raw')
+          out = pathlib.Path('out')
+
+          # SNLI: retain only consensus-labeled examples and the fields required by sensegpt-semantic-supervised.
+          snli_files = list(root.rglob('snli_1.0_*.jsonl'))
+          if not snli_files:
+              raise SystemExit('SNLI JSONL files not found after extraction')
+          snli_counts = {}
+          for src in snli_files:
+              split = src.stem.replace('snli_1.0_', '')
+              if split not in {'train','dev','test'}:
+                  continue
+              dst = out/'snli'/f'{split}.jsonl'
+              n = 0
+              with src.open(encoding='utf-8') as fi, dst.open('w', encoding='utf-8') as fo:
+                  for line in fi:
+                      row = json.loads(line)
+                      label = row.get('gold_label')
+                      if label not in {'entailment','neutral','contradiction'}:
+                          continue
+                      rec = {'premise': row['sentence1'], 'hypothesis': row['sentence2'], 'label': label}
+                      fo.write(json.dumps(rec, ensure_ascii=False)+'\n')
+                      n += 1
+              snli_counts[split] = n
+          if snli_counts.get('train',0) < 500000 or snli_counts.get('dev',0) < 9000:
+              raise SystemExit(f'Unexpected SNLI counts: {snli_counts}')
+
+          # PAWS-Wiki labeled-final only. Discover split paths rather than depending on archive directory name.
+          paws_counts = {}
+          candidates = [p for p in root.rglob('*.tsv') if p.name in {'train.tsv','dev.tsv','test.tsv'} and 'paws' in str(p).lower()]
+          if not candidates:
+              # The official archive may extract under final/ without the word paws.
+              candidates = [p for p in root.rglob('*.tsv') if p.name in {'train.tsv','dev.tsv','test.tsv'}]
+          for src in candidates:
+              split = src.stem
+              if split in paws_counts:
+                  continue
+              dst = out/'paws'/f'{split}.jsonl'
+              n = 0
+              with src.open(encoding='utf-8') as fi, dst.open('w', encoding='utf-8') as fo:
+                  reader = csv.DictReader(fi, delimiter='\t')
+                  fields = set(reader.fieldnames or [])
+                  if not {'sentence1','sentence2','label'} <= fields:
+                      continue
+                  for row in reader:
+                      rec = {'sentence1': row['sentence1'], 'sentence2': row['sentence2'], 'label': int(row['label'])}
+                      fo.write(json.dumps(rec, ensure_ascii=False)+'\n')
+                      n += 1
+              if n:
+                  paws_counts[split] = n
+          if paws_counts.get('train') != 49401 or paws_counts.get('dev') != 8000 or paws_counts.get('test') != 8000:
+              raise SystemExit(f'Unexpected PAWS counts: {paws_counts}')
+
+          # PRESTO: preserve complete English examples so context remains available to the structured parser.
+          presto_sources = {}
+          for split in ('train','dev','test'):
+              matches = list(root.rglob(f'presto_{split}.jsonl'))
+              if not matches:
+                  raise SystemExit(f'PRESTO {split} not found')
+              presto_sources[split] = matches[0]
+          presto_counts = {}
+          for split, src in presto_sources.items():
+              dst = out/'presto'/f'{split}.jsonl'
+              n = 0
+              with src.open(encoding='utf-8') as fi, dst.open('w', encoding='utf-8') as fo:
+                  for line in fi:
+                      row = json.loads(line)
+                      locale = str(row.get('metadata',{}).get('locale',''))
+                      if not locale.lower().startswith('en'):
+                          continue
+                      fo.write(json.dumps(row, ensure_ascii=False)+'\n')
+                      n += 1
+              presto_counts[split] = n
+          if presto_counts.get('train',0) < 50000:
+              raise SystemExit(f'Unexpectedly small English PRESTO split: {presto_counts}')
+
+          manifest = {
+              'snli': snli_counts,
+              'paws': paws_counts,
+              'presto_english': presto_counts,
+              'sources': {
+                  'snli':'https://nlp.stanford.edu/projects/snli/snli_1.0.zip',
+                  'paws':'https://storage.googleapis.com/paws/english/paws_wiki_labeled_final.tar.gz',
+                  'presto':'https://storage.googleapis.com/gresearch/presto/presto_v1.zip'
+              }
+          }
+          (out/'manifest.json').write_text(json.dumps(manifest, indent=2), encoding='utf-8')
+          print(json.dumps(manifest, indent=2))
+
+      - name: Hash normalized outputs
+        run: |
+          find out -type f -print0 | sort -z | xargs -0 sha256sum > out/SHA256SUMS.txt
+          cat out/manifest.json
+          du -sh out/snli out/paws out/presto
+
       - uses: actions/upload-artifact@v4
         with:
-          name: semantic-dataset-bridge-test
-          path: out/
+          name: sense-semantic-snli
+          path: |
+            out/snli/
+            out/manifest.json
+            out/SHA256SUMS.txt
           retention-days: 1
+          compression-level: 9
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sense-semantic-paws
+          path: |
+            out/paws/
+            out/manifest.json
+            out/SHA256SUMS.txt
+          retention-days: 1
+          compression-level: 9
+          if-no-files-found: error
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sense-semantic-presto-en
+          path: |
+            out/presto/
+            out/manifest.json
+            out/SHA256SUMS.txt
+          retention-days: 1
+          compression-level: 9
           if-no-files-found: error
