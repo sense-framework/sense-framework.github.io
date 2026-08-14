@@ -38,7 +38,7 @@ jobs:
           print(counts)
           PY
           find out/presto -type f -print0 | sort -z | xargs -0 sha256sum > out/presto/SHA256SUMS.txt
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: sense-semantic-presto-en
           path: out/presto/
